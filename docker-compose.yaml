@@ -1,0 +1,10 @@
+services:
+  mumble:
+    image: mumblevoip/mumble-server:latest
+    container_name: mumble-server
+    restart: on-failure
+    ports:
+      - "64738:64738/udp"  # Mumble default port
+      - "64738:64738"      # WebRTC port (optional)
+    environment:
+      - MUMBLE_SERVER_WELCOME_TEXT=Welcome to your local Tod test server!
