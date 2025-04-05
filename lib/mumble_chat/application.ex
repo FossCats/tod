@@ -4,7 +4,8 @@ defmodule MumbleChat.Application do
   @impl true
   def start(_type, _args) do
     children = [
-      {MumbleChat.Client, []}
+      {MumbleChat.Client, []},
+      {MumbleChat.PlaybackController, []}
     ]
 
     opts = [strategy: :one_for_one, name: MumbleChat.Supervisor]
