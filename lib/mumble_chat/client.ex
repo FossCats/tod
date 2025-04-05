@@ -23,6 +23,16 @@ defmodule MumbleChat.Client do
   # Chunk size for reading audio files (slightly smaller than max to allow for header)
   @chunk_size 1000
 
+  # Audio timing constants (in milliseconds)
+  # Each sequence number represents 10ms of audio
+  @sequence_duration 10
+  # Reset sequence after 5 seconds of silence
+  @sequence_reset_interval 5000
+  # Amount of audio time per packet (20ms)
+  @audio_per_packet 20
+  # Sample rate for Opus audio (48kHz)
+  @sample_rate 48000
+
   def start_link(_) do
     GenServer.start_link(__MODULE__, [], name: __MODULE__)
   end
@@ -42,6 +52,10 @@ defmodule MumbleChat.Client do
     # Start status timer
     status_timer = Process.send_after(self(), :log_status, 5000)
 
+    # Get current time for audio sequence initialization
+    current_time = System.system_time(:millisecond)
+    Logger.info("Initializing audio sequence tracking at time #{current_time}")
+
     # Return initial state
     {:ok,
      %{
@@ -51,7 +65,12 @@ defmodule MumbleChat.Client do
        session_id: nil,
        current_channel_id: nil,
        status_timer: status_timer,
-       buffer: <<>>
+       buffer: <<>>,
+
+       # Audio sequence tracking (all sequences start at 0)
+       audio_sequence: 0,
+       audio_sequence_start_time: current_time,
+       audio_sequence_last_time: current_time
      }}
   end
 
@@ -135,6 +154,9 @@ defmodule MumbleChat.Client do
   end
 
   def handle_info({:ssl, socket, data}, %{buffer: buffer} = state) when is_binary(data) do
+    # Store current state in process dictionary
+    store_state_in_process_dictionary(state)
+
     # Append the new data to any existing buffer
     combined_data = buffer <> data
 
@@ -147,6 +169,9 @@ defmodule MumbleChat.Client do
 
   # Handle case where we don't have a buffer in the state yet
   def handle_info({:ssl, socket, data}, state) when is_binary(data) do
+    # Store current state in process dictionary
+    store_state_in_process_dictionary(state)
+
     # Initialize buffer and delegate to the version with buffer
     handle_info({:ssl, socket, data}, Map.put(state, :buffer, <<>>))
   end
@@ -633,11 +658,24 @@ defmodule MumbleChat.Client do
     end
   end
 
-  # Streams file data in chunks
+  # Streams file data in chunks with proper timing
   defp stream_file_data(socket, file_path, target) do
     case File.open(file_path, [:read, :binary]) do
       {:ok, file} ->
-        stream_loop(socket, file, target)
+        # Initialize audio stream state
+        state = %{
+          file: file,
+          socket: socket,
+          target: target,
+          sequence: 0,
+          sequence_start_time: System.system_time(:millisecond),
+          sequence_last_time: System.system_time(:millisecond)
+        }
+
+        # Start the streaming loop
+        stream_loop_with_timing(state)
+
+        # Clean up when done
         File.close(file)
         Logger.info("Finished streaming OPUS file: #{file_path}")
 
@@ -646,36 +684,165 @@ defmodule MumbleChat.Client do
     end
   end
 
-  # Reads and sends file data in chunks
-  defp stream_loop(socket, file, target) do
-    case IO.binread(file, @chunk_size) do
-      data when is_binary(data) and byte_size(data) > 0 ->
-        # Create audio packet with proper header
-        packet = create_audio_packet(data, target)
+  # Stream audio with proper timing and sequence tracking
+  defp stream_loop_with_timing(state) do
+    current_time = System.system_time(:millisecond)
 
-        # Send through UDP tunnel
-        send_udp_tunnel(socket, packet)
+    # Check if we should send a packet now
+    if state.sequence_last_time + @audio_per_packet <= current_time do
+      # Read a chunk of audio data
+      case IO.binread(state.file, @chunk_size) do
+        data when is_binary(data) and byte_size(data) > 0 ->
+          # Calculate new sequence value and timing
+          {new_sequence, new_last_time, new_start_time} =
+            calculate_sequence_and_timing(
+              state.sequence,
+              state.sequence_start_time,
+              state.sequence_last_time,
+              current_time
+            )
 
-        # Add a small delay to control streaming rate (adjust as needed)
-        Process.sleep(20)
+          # Create and send the audio packet with proper sequence number
+          packet = create_audio_packet_with_sequence(data, state.target, new_sequence)
+          send_udp_tunnel(state.socket, packet)
 
-        # Continue with next chunk
-        stream_loop(socket, file, target)
+          # Log for debugging
+          Logger.debug(
+            "Sending audio packet with sequence #{new_sequence} at time #{current_time}"
+          )
 
-      _ ->
-        # End of file or error
-        :ok
+          # Update state for next iteration
+          new_state = %{
+            state
+            | sequence: new_sequence,
+              sequence_last_time: new_last_time,
+              sequence_start_time: new_start_time
+          }
+
+          # Add a small delay before checking again, but less than our packet interval
+          Process.sleep(5)
+
+          # Continue streaming
+          stream_loop_with_timing(new_state)
+
+        _ ->
+          # End of file or error
+          :ok
+      end
+    else
+      # Not time to send a packet yet, wait a bit and check again
+      Process.sleep(5)
+      stream_loop_with_timing(state)
     end
   end
 
-  # Creates an audio packet with the proper header
-  # Format: 3 bits for type (4 for OPUS) + 5 bits for target
-  defp create_audio_packet(data, target) do
-    # Create header: type (4 for OPUS) in 3 most significant bits + target in 5 least significant bits
-    header = Bitwise.bor(Bitwise.bsl(@audio_type_opus, 5), Bitwise.band(target, 0x1F))
+  # Calculate the next sequence number and timing values
+  defp calculate_sequence_and_timing(sequence, start_time, last_time, current_time) do
+    # Log the current timing values for debugging
+    Logger.debug(
+      "Timing calculation: seq=#{sequence}, start=#{start_time}, last=#{last_time}, current=#{current_time}"
+    )
 
-    # Combine header with data
-    <<header::size(8), data::binary>>
+    cond do
+      # If we've waited too long, reset the sequence
+      last_time + @sequence_reset_interval <= current_time ->
+        Logger.debug("Resetting sequence due to long pause (> #{@sequence_reset_interval}ms)")
+        {0, current_time, current_time}
+
+      # If there's been a significant pause, recalculate sequence based on elapsed time
+      last_time + @audio_per_packet * 2 <= current_time ->
+        # Calculate new sequence based on elapsed time since start
+        elapsed_ms = current_time - start_time
+        new_sequence = div(elapsed_ms, @sequence_duration)
+        new_last_time = start_time + new_sequence * @sequence_duration
+
+        # Log the new values
+        Logger.debug(
+          "Recalculating sequence after pause: new_seq=#{new_sequence} (elapsed=#{elapsed_ms}ms)"
+        )
+
+        {new_sequence, new_last_time, start_time}
+
+      # For continuous audio, just increment by the packet duration
+      true ->
+        # For continuous streaming, increment by fixed amount
+        frames_per_packet = div(@audio_per_packet, @sequence_duration)
+        new_sequence = sequence + frames_per_packet
+        new_last_time = start_time + new_sequence * @sequence_duration
+
+        # Log the incremented sequence
+        Logger.debug(
+          "Incrementing sequence: #{sequence} -> #{new_sequence} (+#{frames_per_packet})"
+        )
+
+        {new_sequence, new_last_time, start_time}
+    end
+  end
+
+  # Simple VarInt encoding for sequence numbers
+  defp encode_varint(value) when value < 0x80 do
+    # For small values (0-127), use a single byte with MSB=0
+    <<value::size(8)>>
+  end
+
+  defp encode_varint(value) when value < 0x4000 do
+    # For medium values (128-16383), use two bytes with proper VarInt encoding
+    # First byte: MSB=1, followed by 7 lower bits of value
+    # Second byte: MSB=0, followed by the next 7 bits of value
+    # Set MSB and use 7 LSBs
+    byte1 = 0x80 ||| (value &&& 0x7F)
+    # Next 7 bits with MSB=0
+    byte2 = value >>> 7 &&& 0x7F
+    <<byte1::size(8), byte2::size(8)>>
+  end
+
+  defp encode_varint(value) when value < 0x200000 do
+    # For larger values (16384-2097151), use three bytes
+    # Set MSB and use 7 LSBs
+    byte1 = 0x80 ||| (value &&& 0x7F)
+    # Set MSB and use next 7 bits
+    byte2 = 0x80 ||| (value >>> 7 &&& 0x7F)
+    # Final 7 bits with MSB=0
+    byte3 = value >>> 14 &&& 0x7F
+    <<byte1::size(8), byte2::size(8), byte3::size(8)>>
+  end
+
+  defp encode_varint(value) do
+    # For very large values, use four bytes
+    # Set MSB and use 7 LSBs
+    byte1 = 0x80 ||| (value &&& 0x7F)
+    # Set MSB and use next 7 bits
+    byte2 = 0x80 ||| (value >>> 7 &&& 0x7F)
+    # Set MSB and use next 7 bits
+    byte3 = 0x80 ||| (value >>> 14 &&& 0x7F)
+    # Final 7 bits with MSB=0
+    byte4 = value >>> 21 &&& 0x7F
+    <<byte1::size(8), byte2::size(8), byte3::size(8), byte4::size(8)>>
+  end
+
+  # Extract sequence number from packet for debugging
+  defp extract_sequence(packet) do
+    case packet do
+      # Single byte sequence (0-127)
+      <<_header::size(8), seq::size(8), _rest::binary>> when (seq &&& 0x80) == 0 ->
+        {:ok, seq}
+
+      # Two byte sequence (128-16383)
+      <<_header::size(8), byte1::size(8), byte2::size(8), _rest::binary>>
+      when (byte1 &&& 0x80) != 0 and (byte2 &&& 0x80) == 0 ->
+        value = (byte1 &&& 0x7F) ||| (byte2 &&& 0x7F) <<< 7
+        {:ok, value}
+
+      # Three byte sequence (16384-2097151)
+      <<_header::size(8), byte1::size(8), byte2::size(8), byte3::size(8), _rest::binary>>
+      when (byte1 &&& 0x80) != 0 and (byte2 &&& 0x80) != 0 and (byte3 &&& 0x80) == 0 ->
+        value = (byte1 &&& 0x7F) ||| (byte2 &&& 0x7F) <<< 7 ||| (byte3 &&& 0x7F) <<< 14
+        {:ok, value}
+
+      # Unknown format
+      _ ->
+        :error
+    end
   end
 
   # Sends data through the UDP tunnel (message type 1)
@@ -692,7 +859,14 @@ defmodule MumbleChat.Client do
   end
 
   # Handle text commands from users
-  defp handle_text_command(message, actor, %{socket: socket} = state) do
+  defp handle_text_command(
+         message,
+         actor,
+         %{socket: socket, current_channel_id: channel_id} = state
+       ) do
+    # Make sure we have a channel_id from the state, or use the current one
+    target_channel = channel_id || state.current_channel_id
+
     case parse_play_command(message) do
       {:play, url} ->
         Logger.info("Received !play command with URL: #{url}")
@@ -700,7 +874,7 @@ defmodule MumbleChat.Client do
         :ok
 
       _ ->
-        # Not a recognized command, ignore
+        # Not a recognized command, check for other commands
         :ok
     end
 
@@ -708,6 +882,17 @@ defmodule MumbleChat.Client do
       {:pause} ->
         Logger.info("Received !pause command")
         handle_pause_command(socket)
+        :ok
+
+      _ ->
+        # Not a recognized command, check for other commands
+        :ok
+    end
+
+    case parse_resume_command(message) do
+      {:resume} ->
+        Logger.info("Received !resume command")
+        handle_resume_command(socket)
         :ok
 
       _ ->
@@ -742,6 +927,18 @@ defmodule MumbleChat.Client do
     end
   end
 
+  # parse resume message
+  defp parse_resume_command(message) do
+    # Trim whitespace and check if it starts with !resume
+    case String.trim(message) do
+      "!resume" ->
+        {:resume}
+
+      _ ->
+        :not_resume_command
+    end
+  end
+
   # Extract URL from HTML <a> tags if present
   defp extract_url_from_html(text) do
     cond do
@@ -762,8 +959,17 @@ defmodule MumbleChat.Client do
 
   # Handle a play command with the given URL
   defp handle_play_command(url, socket) do
+    # Get the state from the process dictionary since we're in the same process
+    # that's executing the GenServer callbacks
+    state = Process.get(:current_state)
+
     # Send a message indicating we're processing the request
-    send_feedback_message("Processing !play request for: #{url}", socket)
+    send_feedback_message(
+      "Processing !play request for: #{url}",
+      socket,
+      state.session_id,
+      state.current_channel_id
+    )
 
     # Use MediaDownloader to download the audio
     # Set a reasonable max size (100MB)
@@ -771,47 +977,224 @@ defmodule MumbleChat.Client do
 
     # Start the download in a separate process to not block the GenServer
     Task.start(fn ->
+      pid = Process.whereis(__MODULE__)
+
       case MediaDownloader.download_audio(url, max_size_bytes) do
         {:ok, file_path} ->
-          # Download successful, send feedback and start streaming
-          send_feedback_message("Download complete. Starting playback...", socket)
-          stream_opus_file(file_path)
+          # Download successful, send feedback and start playback via PlaybackController
+          GenServer.call(
+            pid,
+            {:get_state_for_feedback,
+             fn state ->
+               send_feedback_message(
+                 "Download complete. Starting playback...",
+                 socket,
+                 state.session_id,
+                 state.current_channel_id
+               )
+             end}
+          )
 
-        # Clean up the file after streaming (optional)
-        # You might want to keep it for caching purposes
-        # File.rm(file_path)
+          # Use the PlaybackController to play the file
+          case MumbleChat.PlaybackController.play(file_path) do
+            :ok ->
+              Logger.info("Playback started via PlaybackController")
+
+            {:error, reason} ->
+              GenServer.call(
+                pid,
+                {:get_state_for_feedback,
+                 fn state ->
+                   send_feedback_message(
+                     "Error starting playback: #{inspect(reason)}",
+                     socket,
+                     state.session_id,
+                     state.current_channel_id
+                   )
+                 end}
+              )
+          end
 
         {:error, :invalid_url} ->
-          send_feedback_message("Error: Invalid URL provided", socket)
+          GenServer.call(
+            pid,
+            {:get_state_for_feedback,
+             fn state ->
+               send_feedback_message(
+                 "Error: Invalid URL provided",
+                 socket,
+                 state.session_id,
+                 state.current_channel_id
+               )
+             end}
+          )
 
         {:error, {:yt_dlp_error, error}} ->
-          send_feedback_message("Error downloading audio: #{inspect(error)}", socket)
+          GenServer.call(
+            pid,
+            {:get_state_for_feedback,
+             fn state ->
+               send_feedback_message(
+                 "Error downloading audio: #{inspect(error)}",
+                 socket,
+                 state.session_id,
+                 state.current_channel_id
+               )
+             end}
+          )
 
         {:error, {:file_too_large, size, max}} ->
-          send_feedback_message(
-            "Error: File too large (#{size} bytes, max: #{max} bytes)",
-            socket
+          GenServer.call(
+            pid,
+            {:get_state_for_feedback,
+             fn state ->
+               send_feedback_message(
+                 "Error: File too large (#{size} bytes, max: #{max} bytes)",
+                 socket,
+                 state.session_id,
+                 state.current_channel_id
+               )
+             end}
           )
 
         {:error, reason} ->
-          send_feedback_message("Error: #{inspect(reason)}", socket)
+          GenServer.call(
+            pid,
+            {:get_state_for_feedback,
+             fn state ->
+               send_feedback_message(
+                 "Error: #{inspect(reason)}",
+                 socket,
+                 state.session_id,
+                 state.current_channel_id
+               )
+             end}
+          )
       end
     end)
   end
 
   # Handle a pause command
   defp handle_pause_command(socket) do
-    # Implement your pause logic here
     Logger.info("Handling !pause command")
-    # Example: Pause the current playback
-    # Your implementation here
+    state = Process.get(:current_state)
+
+    case MumbleChat.PlaybackController.pause() do
+      :ok ->
+        send_feedback_message(
+          "Playback paused",
+          socket,
+          state.session_id,
+          state.current_channel_id
+        )
+
+      {:error, :not_playing} ->
+        send_feedback_message(
+          "Nothing is currently playing",
+          socket,
+          state.session_id,
+          state.current_channel_id
+        )
+
+      {:error, reason} ->
+        send_feedback_message(
+          "Error pausing playback: #{inspect(reason)}",
+          socket,
+          state.session_id,
+          state.current_channel_id
+        )
+    end
+  end
+
+  # Handle a resume command
+  defp handle_resume_command(socket) do
+    Logger.info("Handling !resume command")
+    state = Process.get(:current_state)
+
+    case MumbleChat.PlaybackController.resume() do
+      :ok ->
+        send_feedback_message(
+          "Playback resumed",
+          socket,
+          state.session_id,
+          state.current_channel_id
+        )
+
+      {:error, :not_paused} ->
+        send_feedback_message(
+          "Playback is not paused",
+          socket,
+          state.session_id,
+          state.current_channel_id
+        )
+
+      {:error, reason} ->
+        send_feedback_message(
+          "Error resuming playback: #{inspect(reason)}",
+          socket,
+          state.session_id,
+          state.current_channel_id
+        )
+    end
   end
 
   # Send a feedback message to the channel
-  defp send_feedback_message(text, socket) do
-    # Create a text message with no specific channel (current channel)
-    message_data = MumbleChat.ProtobufHelper.create_text_message(text, nil)
+  defp send_feedback_message(text, socket, session_id, channel_id) do
+    # Create a text message with the right ids
+    message_data = MumbleChat.ProtobufHelper.create_text_message(text, channel_id, session_id)
+
     # Send as TextMessage (type 11)
     send_message(socket, 11, message_data)
+  end
+
+  # Export timing constants for other modules
+  def audio_per_packet, do: @audio_per_packet
+  def sequence_duration, do: @sequence_duration
+  def sequence_reset_interval, do: @sequence_reset_interval
+
+  # Export sequence calculation for other modules
+  def calculate_sequence_timing(sequence, start_time, last_time, current_time) do
+    calculate_sequence_and_timing(sequence, start_time, last_time, current_time)
+  end
+
+  # Export packet creation for other modules
+  def create_audio_packet_with_sequence(data, target, sequence) do
+    # Create header: type (4 for OPUS) in 3 most significant bits + target in 5 least significant bits
+    header = Bitwise.bor(Bitwise.bsl(@audio_type_opus, 5), Bitwise.band(target, 0x1F))
+
+    # Encode sequence as VarInt
+    sequence_bytes = encode_varint(sequence)
+
+    # Combine header, sequence, and audio data
+    <<header::size(8), sequence_bytes::binary, data::binary>>
+  end
+
+  # Export function to send audio packets from other modules
+  def send_audio_packet(packet) do
+    GenServer.cast(__MODULE__, {:send_audio_packet, packet})
+  end
+
+  # Handle sending audio packets from other modules
+  def handle_cast({:send_audio_packet, packet}, %{socket: socket} = state) do
+    if socket != nil do
+      send_udp_tunnel(socket, packet)
+    else
+      Logger.error("Cannot send audio packet - not connected to server")
+    end
+
+    {:noreply, state}
+  end
+
+  # Store state in process dictionary before processing messages
+  defp store_state_in_process_dictionary(state) do
+    Process.put(:current_state, state)
+    state
+  end
+
+  # Handle callback for getting state safely from async functions
+  def handle_call({:get_state_for_feedback, callback}, _from, state) do
+    # Execute the callback with the current state
+    callback.(state)
+    {:reply, :ok, state}
   end
 end

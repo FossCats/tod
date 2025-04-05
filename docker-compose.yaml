@@ -8,15 +8,17 @@ services:
       - "64738:64738"      # Web interface/WebRTC port (optional)
     environment:
       - MUMBLE_SERVER_WELCOME_TEXT=Welcome to your local Tod test server!
+      - MUMBLE_SERVER_NAME=Tod Test Server
+      - MUMBLE_LOG_LEVEL=info
 
-  tod:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: tod
-    restart: on-failure
-    depends_on:
-      - mumble
-    volumes:
-      - .:/app  # optional: if you want live file updates
-    command: ["mix", "run", "--no-halt"]
+  # tod:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile
+  #   container_name: tod
+  #   restart: on-failure
+  #   depends_on:
+  #     - mumble
+  #   volumes:
+  #     - .:/app  # optional: if you want live file updates
+  #   command: ["mix", "run", "--no-halt"]
