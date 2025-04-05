@@ -24,3 +24,6 @@ tod-*.tar
 
 # nix
 .direnv/*
+
+# mumble cert
+*.p12

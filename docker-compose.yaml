@@ -4,7 +4,19 @@ services:
     container_name: mumble-server
     restart: on-failure
     ports:
-      - "64738:64738/udp"  # Mumble default port
-      - "64738:64738"      # WebRTC port (optional)
+      - "64738:64738/udp"  # Mumble voice port
+      - "64738:64738"      # Web interface/WebRTC port (optional)
     environment:
       - MUMBLE_SERVER_WELCOME_TEXT=Welcome to your local Tod test server!
+
+  tod:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: tod
+    restart: on-failure
+    depends_on:
+      - mumble
+    volumes:
+      - .:/app  # optional: if you want live file updates
+    command: ["mix", "run", "--no-halt"]
