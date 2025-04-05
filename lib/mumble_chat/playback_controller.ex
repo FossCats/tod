@@ -326,13 +326,13 @@ defmodule MumbleChat.PlaybackController do
           )
         else
           # Time to send a packet?
-          if sequence_last_time + MumbleChat.Client.audio_per_packet() <= current_time do
+          if sequence_last_time + MumbleChat.Audio.audio_per_packet() <= current_time do
             # Read the next chunk
             case IO.binread(file, chunk_size) do
               data when is_binary(data) and byte_size(data) > 0 ->
                 # Calculate new sequence and timing
                 {new_sequence, new_last_time, new_start_time} =
-                  MumbleChat.Client.calculate_sequence_timing(
+                  MumbleChat.Audio.calculate_sequence_and_timing(
                     sequence,
                     sequence_start_time,
                     sequence_last_time,
@@ -344,9 +344,10 @@ defmodule MumbleChat.PlaybackController do
 
                 # Create and send audio packet with sequence
                 packet =
-                  MumbleChat.Client.create_audio_packet_with_sequence(data, target, new_sequence)
+                  MumbleChat.Audio.create_audio_packet_with_sequence(data, target, new_sequence)
 
-                MumbleChat.Client.send_audio_packet(packet)
+                # Send via GenServer cast to client
+                GenServer.cast(MumbleChat.Client, {:send_audio_packet, packet})
 
                 # Update position
                 new_position = position + byte_size(data)
