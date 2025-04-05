@@ -389,9 +389,11 @@ defmodule MumbleChat.Client do
         case MumbleChat.ProtobufHelper.decode_text_message(message_data) do
           {:ok, decoded} ->
             Logger.info("Chat message from session #{decoded.actor}: #{decoded.message}")
+            handle_text_command(decoded.message, decoded.actor, state)
 
           decoded when is_map(decoded) ->
             Logger.info("Chat message from session #{decoded.actor}: #{decoded.message}")
+            handle_text_command(decoded.message, decoded.actor, state)
 
           {:error, reason} ->
             Logger.error("Failed to decode text message: #{inspect(reason)}")
@@ -625,6 +627,7 @@ defmodule MumbleChat.Client do
           {:noreply, state}
       end
     end
+  end
 
   @doc """
   Streams audio data from an OPUS file to the Mumble server through the TCP connection
@@ -637,13 +640,6 @@ defmodule MumbleChat.Client do
   """
   def stream_opus_file(file_path, target \\ 0) when target in 0..31 do
     GenServer.cast(__MODULE__, {:stream_opus_file, file_path, target})
-  end
-
-  def handle_cast({:send_text_message, text, channel_id}, %{socket: socket} = state) do
-    message_data = MumbleChat.ProtobufHelper.create_text_message(text, channel_id)
-    # 11 is TextMessage type
-    send_message(socket, 11, message_data)
-    {:noreply, state}
   end
   
   def handle_cast({:stream_opus_file, file_path, target}, %{socket: socket} = state) do
@@ -698,12 +694,12 @@ defmodule MumbleChat.Client do
   # Format: 3 bits for type (4 for OPUS) + 5 bits for target
   defp create_audio_packet(data, target) do
     # Create header: type (4 for OPUS) in 3 most significant bits + target in 5 least significant bits
-    header = (@audio_type_opus <<< 5) ||| (target &&& 0x1F)
-    
+    header = (@audio_type_opus <<< 5) bor (target band 0x1F)
+
     # Combine header with data
     <<header::size(8), data::binary>>
-  end
-  
+  end 
+
   # Sends data through the UDP tunnel (message type 1)
   defp send_udp_tunnel(socket, packet) do
     # Ensure packet size doesn't exceed maximum
@@ -715,5 +711,75 @@ defmodule MumbleChat.Client do
       truncated = binary_part(packet, 0, @max_audio_packet_size)
       send_message(socket, @udp_tunnel_type, truncated)
     end
+  end
+  
+  # Handle text commands from users
+  defp handle_text_command(message, actor, %{socket: socket} = state) do
+    case parse_play_command(message) do
+      {:play, url} ->
+        Logger.info("Received !play command with URL: #{url}")
+        handle_play_command(url, socket)
+        :ok
+      _ ->
+        # Not a recognized command, ignore
+        :ok
+    end
+  end
+  
+  # Parse a message to check if it's a !play command
+  defp parse_play_command(message) do
+    # Trim whitespace and check if it starts with !play
+    case String.trim(message) do
+      "!play " <> rest ->
+        # Extract the URL from the rest of the message
+        url = String.trim(rest)
+        {:play, url}
+      _ ->
+        :not_play_command
+    end
+  end
+  
+  # Handle a play command with the given URL
+  defp handle_play_command(url, socket) do
+    # Send a message indicating we're processing the request
+    send_feedback_message("Processing !play request for: #{url}", socket)
+    
+    # Use MediaDownloader to download the audio
+    # Set a reasonable max size (100MB)
+    max_size_bytes = 100 * 1024 * 1024
+    
+    # Start the download in a separate process to not block the GenServer
+    Task.start(fn ->
+      case MediaDownloader.download_audio(url, max_size_bytes) do
+        {:ok, file_path} ->
+          # Download successful, send feedback and start streaming
+          send_feedback_message("Download complete. Starting playback...", socket)
+          stream_opus_file(file_path)
+          
+          # Clean up the file after streaming (optional)
+          # You might want to keep it for caching purposes
+          # File.rm(file_path)
+          
+        {:error, :invalid_url} ->
+          send_feedback_message("Error: Invalid URL provided", socket)
+          
+        {:error, {:yt_dlp_error, error}} ->
+          send_feedback_message("Error downloading audio: #{inspect(error)}", socket)
+          
+        {:error, {:file_too_large, size, max}} ->
+          send_feedback_message("Error: File too large (#{size} bytes, max: #{max} bytes)", socket)
+          
+        {:error, reason} ->
+          send_feedback_message("Error: #{inspect(reason)}", socket)
+      end
+    end)
+  end
+  
+  # Send a feedback message to the channel
+  defp send_feedback_message(text, socket) do
+    # Create a text message with no specific channel (current channel)
+    message_data = MumbleChat.ProtobufHelper.create_text_message(text, nil)
+    # Send as TextMessage (type 11)
+    send_message(socket, 11, message_data)
   end
 end
