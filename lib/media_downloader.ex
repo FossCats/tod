@@ -19,9 +19,9 @@ defmodule MediaDownloader do
   end
 
   defp run_yt_dlp(url) do
-    output_path = "/tmp/downloads/#{:crypto.strong_rand_bytes(16) |> Base.url_encode64()}.opus"
+    output_path = "/tmp/downloads/#{:crypto.strong_rand_bytes(16) |> Base.url_encode64()}.pcm"
     
-    cmd = "yt-dlp -x --audio-format opus -f bestaudio/best -o '#{output_path}' '#{url}'"
+    cmd = "yt-dlp -x --audio-format wav --audio-quality 0 --postprocessor-args \"-ar 48000 -acodec pcm_s16le\" -o '#{output_path}' '#{url}'"
     
     case System.cmd("sh", ["-c", cmd]) do
       {_, 0} -> {:ok, output_path}
