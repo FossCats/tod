@@ -1,4 +1,6 @@
 defmodule MumbleChat.ProtobufHelper do
+  require Logger
+
   # Simple authentication message creator
   def create_authenticate(username, password, _opus) do
     # Format based on the Mumble protocol
@@ -56,11 +58,15 @@ defmodule MumbleChat.ProtobufHelper do
     end
   end
 
-  def create_text_message(message, channel_id) do
+  def create_text_message(message, channel_id, session_id) do
     # Format based on the Mumble protocol
     message_bytes = :binary.list_to_bin(String.to_charlist(message))
 
-    # Start with an empty binary
+    Logger.debug(
+      "Creating text message: '#{message}', channel_id: #{inspect(channel_id)}, session_id: #{inspect(session_id)}"
+    )
+
+    # Start with message field
     message_data = <<
       # Field 5: message (required string)
       42,
@@ -68,15 +74,27 @@ defmodule MumbleChat.ProtobufHelper do
       message_bytes::binary
     >>
 
-    # Add channel_id if provided (field 3: repeated uint32)
+    # Add actor field (our session ID) if we have one
+    message_data =
+      if session_id do
+        # Field 1: actor (uint32)
+        <<8, session_id::little-32, message_data::binary>>
+      else
+        message_data
+      end
+
+    # Add channel_id if provided
     message_data =
       if channel_id do
-        # For each channel_id, add field 3 with the channel ID
         # Field 3: channel_id (repeated uint32)
         <<message_data::binary, 26, 4, channel_id::little-32>>
       else
         message_data
       end
+
+    Logger.debug(
+      "Final message data (#{byte_size(message_data)} bytes): #{inspect(message_data, limit: 30)}"
+    )
 
     message_data
   end

@@ -27,7 +27,7 @@ defmodule MumbleChat.Client do
     Process.send_after(self(), {:connect, host, port, username}, 100)
 
     # Return initial state without connection
-    {:ok, %{socket: nil, ping_timer: nil, connect_attempts: 0}}
+    {:ok, %{socket: nil, ping_timer: nil, connect_attempts: 0, session_id: nil}}
   end
 
   def handle_info({:connect, host, port, username}, state) do
@@ -113,9 +113,16 @@ defmodule MumbleChat.Client do
 
   def handle_info({:ssl, socket, data}, state) when is_binary(data) do
     # Handle incoming SSL data
-    <<message_type::size(16), message_length::size(32), message_data::binary>> = data
-    handle_message(message_type, message_data, state)
-    {:noreply, state}
+    <<message_type::size(16), _message_length::size(32), message_data::binary>> = data
+
+    case handle_message(message_type, message_data, state) do
+      {:ok, new_state} ->
+        # State was updated
+        {:noreply, new_state}
+      _ ->
+        # No state update
+        {:noreply, state}
+    end
   end
 
   def handle_info({:ssl_closed, _socket}, state) do
@@ -134,10 +141,22 @@ defmodule MumbleChat.Client do
 
   defp send_message(socket, message_type, message_data) do
     header = <<message_type::size(16), byte_size(message_data)::size(32)>>
-    :ssl.send(socket, [header, message_data])
+    Logger.debug("Sending message type: #{message_type}, length: #{byte_size(message_data)}")
+
+    result = :ssl.send(socket, [header, message_data])
+
+    case result do
+      :ok ->
+        Logger.debug("Message sent successfully")
+        :ok
+
+      error ->
+        Logger.error("Failed to send message: #{inspect(error)}")
+        error
+    end
   end
 
-  defp handle_message(message_type, message_data, _state) do
+  defp handle_message(message_type, message_data, state) do
     case message_type do
       # Version = 0
       0 ->
@@ -167,7 +186,11 @@ defmodule MumbleChat.Client do
       # ServerSync = 5
       5 ->
         Logger.debug("Received ServerSync message")
-        :ok
+        # Extract and store our session ID from ServerSync
+        session_id = extract_session_from_sync(message_data)
+        Logger.info("Server assigned us session ID: #{session_id}")
+        # Return the session ID to be stored in state
+        {:ok, %{state | session_id: session_id}}
 
       # TextMessage = 11
       11 ->
@@ -193,6 +216,18 @@ defmodule MumbleChat.Client do
     end
   end
 
+  # Helper to extract our session ID from ServerSync message
+  defp extract_session_from_sync(data) do
+    # ServerSync message has session ID as first field (field 1)
+    case data do
+      <<8, session_id::little-32, _rest::binary>> ->
+        session_id
+      _ ->
+        Logger.error("Could not extract session ID from ServerSync message")
+        nil
+    end
+  end
+
   @doc """
   Sends a text message to the specified channel.
   If no channel_id is provided, it will send to the current channel.
@@ -201,10 +236,23 @@ defmodule MumbleChat.Client do
     GenServer.cast(__MODULE__, {:send_text_message, text, channel_id})
   end
 
-  def handle_cast({:send_text_message, text, channel_id}, %{socket: socket} = state) do
-    message_data = MumbleChat.ProtobufHelper.create_text_message(text, channel_id)
-    # 11 is TextMessage type
-    send_message(socket, 11, message_data)
-    {:noreply, state}
+  def handle_cast({:send_text_message, text, channel_id}, %{socket: socket, session_id: session_id} = state) do
+    Logger.info("Attempting to send message: '#{text}' to channel: #{inspect(channel_id)}")
+
+    if socket == nil do
+      Logger.error("Cannot send message - not connected to server")
+      {:noreply, state}
+    else
+      if session_id == nil do
+        Logger.warning("Session ID not yet received from server - message might not be delivered properly")
+      end
+
+      message_data = MumbleChat.ProtobufHelper.create_text_message(text, channel_id, session_id)
+
+      # 11 is TextMessage type
+      result = send_message(socket, 11, message_data)
+      Logger.info("Message sent result: #{inspect(result)}")
+      {:noreply, state}
+    end
   end
 end

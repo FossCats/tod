@@ -27,6 +27,7 @@ defmodule MumbleChat.CLI do
       "/channel " <> rest ->
         case parse_channel_message(rest) do
           {:ok, channel_id, message} ->
+            IO.puts("Sending to channel #{channel_id}: '#{message}'")
             MumbleChat.Client.send_message(message, channel_id)
             message_loop()
 
@@ -38,6 +39,7 @@ defmodule MumbleChat.CLI do
       input ->
         # Remove the trailing newline
         message = String.trim(input)
+        IO.puts("Sending to current channel: '#{message}'")
         MumbleChat.Client.send_message(message)
         message_loop()
     end
