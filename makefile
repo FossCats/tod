@@ -1,5 +1,5 @@
 mumble:
-	docker compose up -d
+	docker compose up 
 
 run:
 	@if [ -z "$$(docker compose ps -q mumble)" ]; then \
