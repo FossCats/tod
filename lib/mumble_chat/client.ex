@@ -21,7 +21,38 @@ defmodule MumbleChat.Client do
 
     # Connect to the Mumble server
     Logger.info("Connecting to Mumble server at #{host}:#{port} as #{username}")
-    connect(host, port, username)
+
+    # Instead of immediately trying to connect, schedule a connection attempt
+    # This allows the application to start even if the connection fails
+    Process.send_after(self(), {:connect, host, port, username}, 100)
+
+    # Return initial state without connection
+    {:ok, %{socket: nil, ping_timer: nil, connect_attempts: 0}}
+  end
+
+  def handle_info({:connect, host, port, username}, state) do
+    case connect(host, port, username) do
+      {:ok, new_state} ->
+        {:noreply, new_state}
+
+      {:error, reason} ->
+        attempts = state.connect_attempts + 1
+
+        if attempts < 5 do
+          Logger.warning(
+            "Connection attempt #{attempts} failed: #{inspect(reason)}. Retrying in #{attempts * 1000}ms..."
+          )
+
+          Process.send_after(self(), {:connect, host, port, username}, attempts * 1000)
+          {:noreply, %{state | connect_attempts: attempts}}
+        else
+          Logger.error(
+            "Failed to connect after #{attempts} attempts. Please check server availability."
+          )
+
+          {:noreply, state}
+        end
+    end
   end
 
   def connect(host, port, username) do
@@ -55,7 +86,7 @@ defmodule MumbleChat.Client do
           auth_data = MumbleChat.ProtobufHelper.create_authenticate(username, "", true)
           send_message(socket, 2, auth_data)
 
-          {:ok, %{socket: socket, ping_timer: start_ping_timer()}}
+          {:ok, %{socket: socket, ping_timer: start_ping_timer(), connect_attempts: 0}}
 
         {:error, {:options, option_error}} ->
           Logger.error("SSL option error: #{inspect(option_error)}")
@@ -63,7 +94,7 @@ defmodule MumbleChat.Client do
 
         {:error, reason} ->
           Logger.error("Failed to connect to Mumble server: #{inspect(reason)}")
-          {:stop, reason}
+          {:error, reason}
       end
     end
   end
@@ -141,18 +172,39 @@ defmodule MumbleChat.Client do
       # TextMessage = 11
       11 ->
         case MumbleChat.ProtobufHelper.decode_text_message(message_data) do
-          {:ok, text_message} ->
-            sender_session = text_message.actor
-            message = text_message.message
-            Logger.info("Chat message from session #{sender_session}: #{message}")
+          {:ok, decoded} ->
+            Logger.info("Chat message from session #{decoded.actor}: #{decoded.message}")
+
+          decoded when is_map(decoded) ->
+            Logger.info("Chat message from session #{decoded.actor}: #{decoded.message}")
 
           {:error, reason} ->
             Logger.error("Failed to decode text message: #{inspect(reason)}")
         end
 
+      # UserStats = 15
+      15 ->
+        Logger.debug("Received UserStats message")
+        :ok
+
       _ ->
         Logger.debug("Received unhandled message type: #{message_type}")
         :ok
     end
+  end
+
+  @doc """
+  Sends a text message to the specified channel.
+  If no channel_id is provided, it will send to the current channel.
+  """
+  def send_message(text, channel_id \\ nil) do
+    GenServer.cast(__MODULE__, {:send_text_message, text, channel_id})
+  end
+
+  def handle_cast({:send_text_message, text, channel_id}, %{socket: socket} = state) do
+    message_data = MumbleChat.ProtobufHelper.create_text_message(text, channel_id)
+    # 11 is TextMessage type
+    send_message(socket, 11, message_data)
+    {:noreply, state}
   end
 end
