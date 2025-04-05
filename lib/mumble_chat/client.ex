@@ -734,6 +734,15 @@ defmodule MumbleChat.Client do
         # Not a recognized command, ignore
         :ok
     end
+    case parse_pause_command(message) do
+      {:pause} ->
+        Logger.info("Received !pause command")
+        handle_pause_command(socket)
+        :ok
+      _ ->
+        # Not a recognized command, ignore
+        :ok
+    end
   end
 
   # Parse a message to check if it's a !play command
@@ -746,6 +755,17 @@ defmodule MumbleChat.Client do
         {:play, url}
       _ ->
         :not_play_command
+    end
+  end
+
+  # parse pause message
+  defp parse_pause_command(message) do
+    # Trim whitespace and check if it starts with !pause
+    case String.trim(message) do
+      "!pause" ->
+        {:pause}
+      _ ->
+        :not_pause_command
     end
   end
 
@@ -783,6 +803,14 @@ defmodule MumbleChat.Client do
           send_feedback_message("Error: #{inspect(reason)}", socket)
       end
     end)
+  end
+
+  # Handle a pause command
+  defp handle_pause_command(socket) do
+    # Implement your pause logic here
+    Logger.info("Handling !pause command")
+    # Example: Pause the current playback
+    # Your implementation here
   end
 
   # Send a feedback message to the channel
