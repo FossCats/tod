@@ -1,4 +1,5 @@
 defmodule MumbleChat.Client do
+  use Bitwise
   use GenServer
   require Logger
   import Bitwise
@@ -703,7 +704,7 @@ defmodule MumbleChat.Client do
   # Format: 3 bits for type (4 for OPUS) + 5 bits for target
   defp create_audio_packet(data, target) do
     # Create header: type (4 for OPUS) in 3 most significant bits + target in 5 least significant bits
-    header = (@audio_type_opus <<< 5) ||| (target &&& 0x1F)
+    header = Bitwise.bor(Bitwise.bsl(@audio_type_opus, 5), Bitwise.band(target, 0x1F))
 
     # Combine header with data
     <<header::size(8), data::binary>>
