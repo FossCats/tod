@@ -8,6 +8,18 @@ defmodule MumbleChat.Client do
   @version_major 1
   @version_minor 3
   @version_patch 0
+  
+  # UDP Tunnel message type
+  @udp_tunnel_type 1
+  
+  # Audio packet types
+  @audio_type_opus 4
+  
+  # Maximum audio packet size (1020 bytes as per Mumble spec)
+  @max_audio_packet_size 1020
+  
+  # Chunk size for reading audio files (slightly smaller than max to allow for header)
+  @chunk_size 1000
 
   def start_link(_) do
     GenServer.start_link(__MODULE__, [], name: __MODULE__)
@@ -253,6 +265,96 @@ defmodule MumbleChat.Client do
       result = send_message(socket, 11, message_data)
       Logger.info("Message sent result: #{inspect(result)}")
       {:noreply, state}
+    end
+
+  @doc """
+  Streams audio data from an OPUS file to the Mumble server through the TCP connection
+  using the UDP tunnel.
+  
+  ## Parameters
+  
+  - `file_path`: Path to the OPUS audio file
+  - `target`: Target for the audio packet (5 bits, default 0)
+  """
+  def stream_opus_file(file_path, target \\ 0) when target in 0..31 do
+    GenServer.cast(__MODULE__, {:stream_opus_file, file_path, target})
+  end
+
+  def handle_cast({:send_text_message, text, channel_id}, %{socket: socket} = state) do
+    message_data = MumbleChat.ProtobufHelper.create_text_message(text, channel_id)
+    # 11 is TextMessage type
+    send_message(socket, 11, message_data)
+    {:noreply, state}
+  end
+  
+  def handle_cast({:stream_opus_file, file_path, target}, %{socket: socket} = state) do
+    case File.exists?(file_path) do
+      true ->
+        Logger.info("Starting to stream OPUS file: #{file_path}")
+        # Start streaming in a separate process to not block the GenServer
+        Task.start(fn -> stream_file_data(socket, file_path, target) end)
+        {:noreply, state}
+      false ->
+        Logger.error("OPUS file not found: #{file_path}")
+        {:noreply, state}
+    end
+  end
+  
+  # Streams file data in chunks
+  defp stream_file_data(socket, file_path, target) do
+    case File.open(file_path, [:read, :binary]) do
+      {:ok, file} ->
+        stream_loop(socket, file, target)
+        File.close(file)
+        Logger.info("Finished streaming OPUS file: #{file_path}")
+      
+      {:error, reason} ->
+        Logger.error("Failed to open OPUS file: #{inspect(reason)}")
+    end
+  end
+  
+  # Reads and sends file data in chunks
+  defp stream_loop(socket, file, target) do
+    case IO.binread(file, @chunk_size) do
+      data when is_binary(data) and byte_size(data) > 0 ->
+        # Create audio packet with proper header
+        packet = create_audio_packet(data, target)
+        
+        # Send through UDP tunnel
+        send_udp_tunnel(socket, packet)
+        
+        # Add a small delay to control streaming rate (adjust as needed)
+        Process.sleep(20)
+        
+        # Continue with next chunk
+        stream_loop(socket, file, target)
+      
+      _ ->
+        # End of file or error
+        :ok
+    end
+  end
+  
+  # Creates an audio packet with the proper header
+  # Format: 3 bits for type (4 for OPUS) + 5 bits for target
+  defp create_audio_packet(data, target) do
+    # Create header: type (4 for OPUS) in 3 most significant bits + target in 5 least significant bits
+    header = (@audio_type_opus <<< 5) ||| (target &&& 0x1F)
+    
+    # Combine header with data
+    <<header::size(8), data::binary>>
+  end
+  
+  # Sends data through the UDP tunnel (message type 1)
+  defp send_udp_tunnel(socket, packet) do
+    # Ensure packet size doesn't exceed maximum
+    if byte_size(packet) <= @max_audio_packet_size do
+      send_message(socket, @udp_tunnel_type, packet)
+    else
+      Logger.warning("Audio packet exceeds maximum size and was truncated")
+      # Truncate packet to maximum size
+      truncated = binary_part(packet, 0, @max_audio_packet_size)
+      send_message(socket, @udp_tunnel_type, truncated)
     end
   end
 end
