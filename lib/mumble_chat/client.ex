@@ -33,17 +33,16 @@ defmodule MumbleChat.Client do
     port = (System.get_env("MUMBLE_PORT") || @default_port) |> to_string() |> String.to_integer()
     username = System.get_env("MUMBLE_USERNAME") || @default_username
 
-    # Connect to the Mumble server
+    # Log connection intent
     Logger.info("Connecting to Mumble server at #{host}:#{port} as #{username}")
 
-    # Instead of immediately trying to connect, schedule a connection attempt
-    # This allows the application to start even if the connection fails
+    # Schedule a connection attempt
     Process.send_after(self(), {:connect, host, port, username}, 100)
 
     # Start status timer
     status_timer = Process.send_after(self(), :log_status, 5000)
 
-    # Return initial state without connection
+    # Return initial state
     {:ok,
      %{
        socket: nil,
@@ -82,18 +81,11 @@ defmodule MumbleChat.Client do
   end
 
   def connect(host, port, username) do
-    # Find path to the certificates file
-    cert_path = :code.priv_dir(:mumble_chat) ++ ~c"/cert.p12"
-
-    Logger.info("Looking for certificate at: #{inspect(cert_path)}")
-
-    # Try connecting without any certificate - simplest approach for initial testing
+    # SSL connection options
     ssl_options = [
       verify: :verify_none,
       active: true
     ]
-
-    Logger.debug("Using SSL options: #{inspect(ssl_options)}")
 
     case :ssl.connect(String.to_charlist(host), port, ssl_options) do
       {:ok, socket} ->
@@ -101,19 +93,11 @@ defmodule MumbleChat.Client do
 
         # Send version information
         version = <<@version_major::size(16), @version_minor::size(8), @version_patch::size(8)>>
-        result = send_message(socket, 0, version)
-        Logger.info("Sent version message: #{inspect(result)}")
+        send_message(socket, 0, version)
 
-        # Send authentication (username, password, etc.)
+        # Send authentication
         auth_data = MumbleChat.ProtobufHelper.create_authenticate(username, "", true)
-        result = send_message(socket, 2, auth_data)
-        Logger.info("Sent authentication message: #{inspect(result)}")
-
-        # The server will now follow the Mumble connection sequence:
-        # 1. CryptSetup (message type 15) - we'll respond in the handle_message function
-        # 2. Channel states (message type 7)
-        # 3. User states (message type 9)
-        # 4. ServerSync (message type 5) - with our session ID
+        send_message(socket, 2, auth_data)
 
         # Create new state
         new_state = %{
@@ -177,11 +161,6 @@ defmodule MumbleChat.Client do
           # Extract the message data
           <<message_data::binary-size(message_length), remaining::binary>> = rest
 
-          # Log the received message
-          Logger.info(
-            "📩 Received message: type=#{message_type}, length=#{message_length}, data sample: #{inspect(binary_part(message_data, 0, min(16, byte_size(message_data))), limit: :infinity)}"
-          )
-
           # Handle the message
           new_state = handle_message(message_type, message_data, state)
 
@@ -209,10 +188,6 @@ defmodule MumbleChat.Client do
   end
 
   def handle_info(:log_status, state) do
-    Logger.info(
-      "💡 Connection Status: connected=#{state.socket != nil}, session_id=#{state.session_id || "none"}, channel_id=#{state.current_channel_id || "none"}"
-    )
-
     # Reschedule the status report
     status_timer = Process.send_after(self(), :log_status, 5000)
     {:noreply, %{state | status_timer: status_timer}}
@@ -644,13 +619,6 @@ defmodule MumbleChat.Client do
     GenServer.cast(__MODULE__, {:stream_opus_file, file_path, target})
   end
 
-  def handle_cast({:send_text_message, text, channel_id}, %{socket: socket} = state) do
-    message_data = MumbleChat.ProtobufHelper.create_text_message(text, channel_id)
-    # 11 is TextMessage type
-    send_message(socket, 11, message_data)
-    {:noreply, state}
-  end
-
   def handle_cast({:stream_opus_file, file_path, target}, %{socket: socket} = state) do
     case File.exists?(file_path) do
       true ->
@@ -749,7 +717,7 @@ defmodule MumbleChat.Client do
   end
 
   # Parse a message to check if it's a !play command
-  defp parse_play_command(message) do
+  defp parse_play_command(message) when is_binary(message) do
     # Trim whitespace and check if it starts with !play
     case String.trim(message) do
       "!play " <> rest ->

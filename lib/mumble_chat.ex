@@ -7,10 +7,7 @@ defmodule MumbleChat do
   Starts the Mumble chat client.
   """
   def main(args \\ []) do
-    # Parse command line arguments if needed
     Application.start(:mumble_chat)
-
-    # Keep the application running
     Process.sleep(:infinity)
   end
 end
