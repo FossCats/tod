@@ -135,6 +135,9 @@ defmodule MumbleChat.Client do
   end
 
   def handle_info({:ssl, socket, data}, %{buffer: buffer} = state) when is_binary(data) do
+    # Store the current state in the process dictionary for helper functions to access
+    Process.put(:current_state, state)
+
     # Append the new data to any existing buffer
     combined_data = buffer <> data
 
@@ -551,6 +554,9 @@ defmodule MumbleChat.Client do
   end
 
   def handle_cast({:send_text_message, text, channel_id}, %{socket: socket} = state) do
+    # Store the current state in the process dictionary for helper functions to access
+    Process.put(:current_state, state)
+
     Logger.info("Attempting to send message: '#{text}' to channel: #{inspect(channel_id)}")
 
     if socket == nil do
@@ -692,7 +698,14 @@ defmodule MumbleChat.Client do
   end
 
   # Handle text commands from users
-  defp handle_text_command(message, actor, %{socket: socket} = state) do
+  defp handle_text_command(
+         message,
+         actor,
+         %{socket: socket, current_channel_id: channel_id} = state
+       ) do
+    # Make sure we have a channel_id from the state, or use the current one
+    target_channel = channel_id || state.current_channel_id
+
     case parse_play_command(message) do
       {:play, url} ->
         Logger.info("Received !play command with URL: #{url}")
@@ -708,6 +721,17 @@ defmodule MumbleChat.Client do
       {:pause} ->
         Logger.info("Received !pause command")
         handle_pause_command(socket)
+        :ok
+
+      _ ->
+        # Not a recognized command, ignore
+        :ok
+    end
+
+    case parse_resume_command(message) do
+      {:resume} ->
+        Logger.info("Received !resume command")
+        handle_resume_command(socket)
         :ok
 
       _ ->
@@ -742,6 +766,18 @@ defmodule MumbleChat.Client do
     end
   end
 
+  # Parse a message to check if it's a !resume command
+  defp parse_resume_command(message) do
+    # Trim whitespace and check if it starts with !resume
+    case String.trim(message) do
+      "!resume" ->
+        {:resume}
+
+      _ ->
+        :not_resume_command
+    end
+  end
+
   # Extract URL from HTML <a> tags if present
   defp extract_url_from_html(text) do
     cond do
@@ -762,6 +798,12 @@ defmodule MumbleChat.Client do
 
   # Handle a play command with the given URL
   defp handle_play_command(url, socket) do
+    # Use the GenServer's state that we have access to directly
+    # Don't try to call :sys.get_state which would deadlock
+    state = Process.get(:current_state) || %{session_id: nil, current_channel_id: nil}
+    session_id = state.session_id
+    channel_id = state.current_channel_id
+
     # Send a message indicating we're processing the request
     send_feedback_message("Processing !play request for: #{url}", socket)
 
@@ -773,45 +815,177 @@ defmodule MumbleChat.Client do
     Task.start(fn ->
       case MediaDownloader.download_audio(url, max_size_bytes) do
         {:ok, file_path} ->
-          # Download successful, send feedback and start streaming
-          send_feedback_message("Download complete. Starting playback...", socket)
-          stream_opus_file(file_path)
+          # Download successful, send feedback and start streaming via PlaybackController
+          message_data =
+            MumbleChat.ProtobufHelper.create_text_message(
+              "Download complete. Starting playback...",
+              channel_id,
+              session_id
+            )
 
-        # Clean up the file after streaming (optional)
-        # You might want to keep it for caching purposes
-        # File.rm(file_path)
+          send_message(socket, 11, message_data)
+
+          # Stop any current playback and play the new file
+          MumbleChat.PlaybackController.play(file_path)
 
         {:error, :invalid_url} ->
-          send_feedback_message("Error: Invalid URL provided", socket)
+          message_data =
+            MumbleChat.ProtobufHelper.create_text_message(
+              "Error: Invalid URL provided",
+              channel_id,
+              session_id
+            )
+
+          send_message(socket, 11, message_data)
 
         {:error, {:yt_dlp_error, error}} ->
-          send_feedback_message("Error downloading audio: #{inspect(error)}", socket)
+          message_data =
+            MumbleChat.ProtobufHelper.create_text_message(
+              "Error downloading audio: #{inspect(error)}",
+              channel_id,
+              session_id
+            )
+
+          send_message(socket, 11, message_data)
 
         {:error, {:file_too_large, size, max}} ->
-          send_feedback_message(
-            "Error: File too large (#{size} bytes, max: #{max} bytes)",
-            socket
-          )
+          message_data =
+            MumbleChat.ProtobufHelper.create_text_message(
+              "Error: File too large (#{size} bytes, max: #{max} bytes)",
+              channel_id,
+              session_id
+            )
+
+          send_message(socket, 11, message_data)
 
         {:error, reason} ->
-          send_feedback_message("Error: #{inspect(reason)}", socket)
+          message_data =
+            MumbleChat.ProtobufHelper.create_text_message(
+              "Error: #{inspect(reason)}",
+              channel_id,
+              session_id
+            )
+
+          send_message(socket, 11, message_data)
       end
     end)
   end
 
-  # Handle a pause command
+  # Handle pause command
   defp handle_pause_command(socket) do
-    # Implement your pause logic here
-    Logger.info("Handling !pause command")
-    # Example: Pause the current playback
-    # Your implementation here
+    # Use the GenServer's state that we have access to directly
+    # Don't try to call :sys.get_state which would deadlock
+    state = Process.get(:current_state) || %{session_id: nil, current_channel_id: nil}
+    session_id = state.session_id
+    channel_id = state.current_channel_id
+
+    case MumbleChat.PlaybackController.pause() do
+      :ok ->
+        message_data =
+          MumbleChat.ProtobufHelper.create_text_message(
+            "Playback paused. Use !resume to continue.",
+            channel_id,
+            session_id
+          )
+
+        send_message(socket, 11, message_data)
+
+      {:error, :not_playing} ->
+        message_data =
+          MumbleChat.ProtobufHelper.create_text_message(
+            "No active playback to pause.",
+            channel_id,
+            session_id
+          )
+
+        send_message(socket, 11, message_data)
+
+      {:error, reason} ->
+        message_data =
+          MumbleChat.ProtobufHelper.create_text_message(
+            "Error pausing playback: #{inspect(reason)}",
+            channel_id,
+            session_id
+          )
+
+        send_message(socket, 11, message_data)
+    end
+  end
+
+  # Handle resume command
+  defp handle_resume_command(socket) do
+    # Use the GenServer's state that we have access to directly
+    # Don't try to call :sys.get_state which would deadlock
+    state = Process.get(:current_state) || %{session_id: nil, current_channel_id: nil}
+    session_id = state.session_id
+    channel_id = state.current_channel_id
+
+    case MumbleChat.PlaybackController.resume() do
+      :ok ->
+        message_data =
+          MumbleChat.ProtobufHelper.create_text_message(
+            "Playback resumed.",
+            channel_id,
+            session_id
+          )
+
+        send_message(socket, 11, message_data)
+
+      {:error, :not_paused} ->
+        message_data =
+          MumbleChat.ProtobufHelper.create_text_message(
+            "No paused playback to resume.",
+            channel_id,
+            session_id
+          )
+
+        send_message(socket, 11, message_data)
+
+      {:error, reason} ->
+        message_data =
+          MumbleChat.ProtobufHelper.create_text_message(
+            "Error resuming playback: #{inspect(reason)}",
+            channel_id,
+            session_id
+          )
+
+        send_message(socket, 11, message_data)
+    end
   end
 
   # Send a feedback message to the channel
   defp send_feedback_message(text, socket) do
-    # Create a text message with no specific channel (current channel)
-    message_data = MumbleChat.ProtobufHelper.create_text_message(text, nil)
+    # Use the GenServer's state that we have access to directly
+    # Don't try to call :sys.get_state which would deadlock
+    state = Process.get(:current_state) || %{session_id: nil, current_channel_id: nil}
+
+    # Create a text message with the proper channel_id and session_id
+    message_data =
+      MumbleChat.ProtobufHelper.create_text_message(
+        text,
+        state.current_channel_id,
+        state.session_id
+      )
+
     # Send as TextMessage (type 11)
     send_message(socket, 11, message_data)
+  end
+
+  @doc """
+  Sends an audio packet through the UDP tunnel.
+  The packet should already have the proper header.
+  """
+  def send_audio_packet(packet) do
+    GenServer.cast(__MODULE__, {:send_audio_packet, packet})
+  end
+
+  def handle_cast({:send_audio_packet, packet}, %{socket: socket} = state) do
+    if socket == nil do
+      Logger.error("Cannot send audio packet - not connected to server")
+    else
+      send_udp_tunnel(socket, packet)
+    end
+
+    {:noreply, state}
   end
 end
