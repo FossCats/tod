@@ -33,7 +33,7 @@ defmodule MumbleChat.ProtobufHelper do
   end
 
   # Simple text message decoder
-  def decode_text_message(data) do
+  def decode_text_message(data) when is_binary(data) do
     # Very basic parser - in real code you would need a proper protobuf decoder
     # This just extracts actor ID and message for demonstration
     case data do
@@ -46,7 +46,12 @@ defmodule MumbleChat.ProtobufHelper do
     end
   end
 
-  defp extract_message(data) do
+  # Handle non-binary data
+  def decode_text_message(_) do
+    %{actor: 0, message: "Invalid message data"}
+  end
+
+  defp extract_message(data) when is_binary(data) do
     # Very simplified - looks for the message field (5)
     case :binary.match(data, <<42>>) do
       {pos, 1} ->
@@ -57,6 +62,11 @@ defmodule MumbleChat.ProtobufHelper do
       _ ->
         "No message found"
     end
+  end
+
+  # Handle non-binary data
+  defp extract_message(_) do
+    "Invalid message data"
   end
 
   def create_text_message(message, channel_id, session_id \\ nil) do

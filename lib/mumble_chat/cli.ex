@@ -28,6 +28,9 @@ defmodule MumbleChat.CLI do
 
   defp message_loop do
     case IO.gets("> ") do
+      :eof ->
+        IO.puts("Input stream closed. Exiting.")
+
       "exit\n" ->
         IO.puts("Goodbye!")
 

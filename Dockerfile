@@ -1,4 +1,4 @@
-FROM elixir:1.15
+FROM elixir:1.18
 
 # Install yt-dlp and Python
 RUN apt-get update && \
@@ -18,5 +18,3 @@ RUN mix local.hex --force && \
     mix deps.get && \
     mix compile
 
-# Start the app
-CMD ["mix", "run", "--no-halt"]
