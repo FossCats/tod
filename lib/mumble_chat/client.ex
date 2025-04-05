@@ -1,4 +1,5 @@
 defmodule MumbleChat.Client do
+  use Bitwise
   use GenServer
   require Logger
   import Bitwise
@@ -671,7 +672,7 @@ defmodule MumbleChat.Client do
   # Format: 3 bits for type (4 for OPUS) + 5 bits for target
   defp create_audio_packet(data, target) do
     # Create header: type (4 for OPUS) in 3 most significant bits + target in 5 least significant bits
-    header = @audio_type_opus <<< 5 ||| (target &&& 0x1F)
+    header = Bitwise.bor(Bitwise.bsl(@audio_type_opus, 5), Bitwise.band(target, 0x1F))
 
     # Combine header with data
     <<header::size(8), data::binary>>
@@ -702,6 +703,17 @@ defmodule MumbleChat.Client do
         # Not a recognized command, ignore
         :ok
     end
+
+    case parse_pause_command(message) do
+      {:pause} ->
+        Logger.info("Received !pause command")
+        handle_pause_command(socket)
+        :ok
+
+      _ ->
+        # Not a recognized command, ignore
+        :ok
+    end
   end
 
   # Parse a message to check if it's a !play command
@@ -709,8 +721,8 @@ defmodule MumbleChat.Client do
     # Trim whitespace and check if it starts with !play
     case String.trim(message) do
       "!play " <> rest ->
-        # Extract the URL from the rest of the message
-        url = String.trim(rest)
+        # Extract the URL from the rest of the message and handle HTML formatting
+        url = rest |> String.trim() |> extract_url_from_html()
         {:play, url}
 
       _ ->
@@ -718,9 +730,34 @@ defmodule MumbleChat.Client do
     end
   end
 
-  # Handle non-binary messages safely
-  defp parse_play_command(_) do
-    :not_play_command
+  # parse pause message
+  defp parse_pause_command(message) do
+    # Trim whitespace and check if it starts with !pause
+    case String.trim(message) do
+      "!pause" ->
+        {:pause}
+
+      _ ->
+        :not_pause_command
+    end
+  end
+
+  # Extract URL from HTML <a> tags if present
+  defp extract_url_from_html(text) do
+    cond do
+      # Case 1: Text contains an <a> tag with href attribute
+      String.contains?(text, "<a href=") ->
+        # Extract the URL from the href attribute
+        case Regex.run(~r/<a href="([^"]+)"/, text, capture: :all_but_first) do
+          [url] -> url
+          # Fallback to original text if regex doesn't match
+          _ -> text
+        end
+
+      # Case 2: No HTML formatting, return the text as is
+      true ->
+        text
+    end
   end
 
   # Handle a play command with the given URL
@@ -760,6 +797,14 @@ defmodule MumbleChat.Client do
           send_feedback_message("Error: #{inspect(reason)}", socket)
       end
     end)
+  end
+
+  # Handle a pause command
+  defp handle_pause_command(socket) do
+    # Implement your pause logic here
+    Logger.info("Handling !pause command")
+    # Example: Pause the current playback
+    # Your implementation here
   end
 
   # Send a feedback message to the channel
