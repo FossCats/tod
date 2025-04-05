@@ -730,15 +730,18 @@ defmodule MumbleChat.Client do
         Logger.info("Received !play command with URL: #{url}")
         handle_play_command(url, socket)
         :ok
+
       _ ->
         # Not a recognized command, ignore
         :ok
     end
+
     case parse_pause_command(message) do
       {:pause} ->
         Logger.info("Received !pause command")
         handle_pause_command(socket)
         :ok
+
       _ ->
         # Not a recognized command, ignore
         :ok
@@ -750,9 +753,10 @@ defmodule MumbleChat.Client do
     # Trim whitespace and check if it starts with !play
     case String.trim(message) do
       "!play " <> rest ->
-        # Extract the URL from the rest of the message
-        url = String.trim(rest)
+        # Extract the URL from the rest of the message and handle HTML formatting
+        url = rest |> String.trim() |> extract_url_from_html()
         {:play, url}
+
       _ ->
         :not_play_command
     end
@@ -764,8 +768,27 @@ defmodule MumbleChat.Client do
     case String.trim(message) do
       "!pause" ->
         {:pause}
+
       _ ->
         :not_pause_command
+    end
+  end
+
+  # Extract URL from HTML <a> tags if present
+  defp extract_url_from_html(text) do
+    cond do
+      # Case 1: Text contains an <a> tag with href attribute
+      String.contains?(text, "<a href=") ->
+        # Extract the URL from the href attribute
+        case Regex.run(~r/<a href="([^"]+)"/, text, capture: :all_but_first) do
+          [url] -> url
+          # Fallback to original text if regex doesn't match
+          _ -> text
+        end
+
+      # Case 2: No HTML formatting, return the text as is
+      true ->
+        text
     end
   end
 
@@ -786,9 +809,9 @@ defmodule MumbleChat.Client do
           send_feedback_message("Download complete. Starting playback...", socket)
           stream_opus_file(file_path)
 
-          # Clean up the file after streaming (optional)
-          # You might want to keep it for caching purposes
-          # File.rm(file_path)
+        # Clean up the file after streaming (optional)
+        # You might want to keep it for caching purposes
+        # File.rm(file_path)
 
         {:error, :invalid_url} ->
           send_feedback_message("Error: Invalid URL provided", socket)
@@ -797,7 +820,10 @@ defmodule MumbleChat.Client do
           send_feedback_message("Error downloading audio: #{inspect(error)}", socket)
 
         {:error, {:file_too_large, size, max}} ->
-          send_feedback_message("Error: File too large (#{size} bytes, max: #{max} bytes)", socket)
+          send_feedback_message(
+            "Error: File too large (#{size} bytes, max: #{max} bytes)",
+            socket
+          )
 
         {:error, reason} ->
           send_feedback_message("Error: #{inspect(reason)}", socket)
