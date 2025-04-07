@@ -1,28 +1,14 @@
 [package]
-name = "rust"
+name = "rust_v2"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-# Core dependencies
-tokio = { version = "1.28", features = ["full"] }
-anyhow = "1.0"
-thiserror = "1.0"
-tracing = "0.1"
-tracing-subscriber = "0.3"
-
-# Mumble client
-mumble-rs = "0.1.1"
-
-# TLS/certificates
-rustls = "0.21"
-rustls-pemfile = "1.0"
-webpki-roots = "0.23"  # Optional: provides standard root certificates
-
-# YouTube download
-rustube = "0.6"
-
-# Audio processing
-symphonia = { version = "0.5", features = ["all"] }
-rubato = "0.14"
-rand = "0.8"
+argparse = "0.2.2"
+bytes = "1.10.1"
+futures = "0.3.31"
+mumble-protocol-2x = "0.6.0"
+native-tls = "0.2.14"
+tokio = { version = "1.44.2", features = ["full"] }
+tokio-native-tls = "0.3.1"
+tokio-util = { version = "0.7.14", features = ["full"] }
